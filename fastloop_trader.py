@@ -415,10 +415,12 @@ def choose_best_market_for_signal(markets, direction, existing_questions=None):
 def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
     """Get price momentum from Binance public API.
     Tries multiple public endpoints because api.binance.com may return HTTP 451 from some hosts.
+
+    Returns: {momentum_pct, direction, price_now, price_then, avg_volume, latest_volume, volume_ratio, candles}
     """
     bases = [
         os.environ.get("BINANCE_API_BASE", "").strip(),
-        "https://data-api.binance.vision",   # обычно самый “проходимый”
+        "https://data-api.binance.vision",
         "https://api.binance.com",
         "https://api1.binance.com",
         "https://api2.binance.com",
@@ -429,49 +431,61 @@ def get_binance_momentum(symbol="BTCUSDT", lookback_minutes=5):
     last_err = None
     for base in bases:
         url = f"{base}/api/v3/klines?symbol={symbol}&interval=1m&limit={lookback_minutes}"
-        result = _api_request_with_retries(url, retries=2)
-        if result and not isinstance(result, dict):  # ожидаем список свечей
-            candles = result
-            try:
-                if len(candles) < 2:
-                    return None
-                price_then = float(candles[0][1])
-                price_now = float(candles[-1][4])
-                momentum_pct = ((price_now - price_then) / price_then) * 100
-                direction = "up" if momentum_pct > 0 else "down"
-                volumes = [float(c[5]) for c in candles]
-                avg_volume = sum(volumes) / len(volumes)
-                latest_volume = volumes[-1]
-                volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
-                return {
-                    "momentum_pct": momentum_pct,
-                    "direction": direction,
-                    "price_now": price_now,
-                    "price_then": price_then,
-                    "avg_volume": avg_volume,
-                    "latest_volume": latest_volume,
-                    "volume_ratio": volume_ratio,
-                    "candles": len(candles),
-                }
-            except Exception:
-                return None
 
-        # если dict — там, скорее всего, {"error": ..., "status_code": ...}
-        if isinstance(result, dict) and result.get("error"):
-            last_err = f"{base} -> {result.get('status_code')}: {result.get('error')}"
-        else:
-            last_err = f"{base} -> unexpected response"
+        # используем существующий хелпер проекта
+        result = _api_request(url)
+
+        # _api_request возвращает dict при ошибке: {"error": "...", "status_code": ...}
+        if not result:
+            last_err = f"{base} -> empty response"
+            continue
+
+        if isinstance(result, dict):
+            # это ошибка
+            err = result.get("error")
+            sc = result.get("status_code")
+            last_err = f"{base} -> {sc}: {err}"
+            continue
+
+        if not isinstance(result, list):
+            last_err = f"{base} -> unexpected type: {type(result).__name__}"
+            continue
+
+        # успех: список свечей
+        candles = result
+        try:
+            if len(candles) < 2:
+                last_err = f"{base} -> not enough candles"
+                continue
+
+            price_then = float(candles[0][1])   # open первой свечи
+            price_now = float(candles[-1][4])   # close последней свечи
+
+            momentum_pct = ((price_now - price_then) / price_then) * 100
+            direction = "up" if momentum_pct > 0 else "down"
+
+            volumes = [float(c[5]) for c in candles]
+            avg_volume = sum(volumes) / len(volumes)
+            latest_volume = volumes[-1]
+            volume_ratio = latest_volume / avg_volume if avg_volume > 0 else 1.0
+
+            return {
+                "momentum_pct": momentum_pct,
+                "direction": direction,
+                "price_now": price_now,
+                "price_then": price_then,
+                "avg_volume": avg_volume,
+                "latest_volume": latest_volume,
+                "volume_ratio": volume_ratio,
+                "candles": len(candles),
+                "source": base,
+            }
+        except Exception as e:
+            last_err = f"{base} -> parse error: {e}"
+            continue
 
     # если все базы отвалились
     return {"error": f"All Binance endpoints failed. Last: {last_err}", "status_code": 451}
-
-    result = _api_request(url)
-    if not result:
-        return None
-    if isinstance(result, dict) and result.get("error"):
-        return {"error": result.get("error")}
-    if not isinstance(result, list):
-        return {"error": f"Unexpected Binance response type: {type(result).__name__}"}
 
     try:
         # Kline format: [open_time, open, high, low, close, volume, ...]
